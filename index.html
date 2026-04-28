@@ -69,6 +69,7 @@ let clapHUD;
 const controllers = [];
 let audioListener, oceanSound;
 let currentTitle = "", currentInstruction = "";
+let networkErrorCount = 0;
 
 const diagEl = document.getElementById('diag');
 function diag(msg) { if (diagEl) diagEl.textContent = msg; console.log('[diag]', msg); }
@@ -143,6 +144,18 @@ function setupVideoBackground() {
   videoEl.setAttribute('webkit-playsinline','');
   videoEl.setAttribute('playsinline','');
 
+  // VIGTIGT HACK TIL META QUEST / WEBXR: 
+  // Tilføj videoen til DOM'en usynligt. Dette forhindrer browseren i at 
+  // sætte video-afkodning og netværkskald på pause i baggrunden, når vi er i VR.
+  videoEl.style.position = 'absolute';
+  videoEl.style.top = '0';
+  videoEl.style.width = '1px';
+  videoEl.style.height = '1px';
+  videoEl.style.opacity = '0.001';
+  videoEl.style.pointerEvents = 'none';
+  videoEl.style.zIndex = '-1';
+  document.body.appendChild(videoEl);
+
   videoEl.addEventListener('loadedmetadata', () =>
     diag('video: meta '+videoEl.videoWidth+'x'+videoEl.videoHeight));
   videoEl.addEventListener('canplay', () => {
@@ -164,14 +177,11 @@ function setupVideoBackground() {
       backBufferLength: 30,
       maxBufferLength: 15,   // Keeps memory footprint low on mobile VR
       maxMaxBufferLength: 30,
-      
-      // INDBYGGET RETRY LOGIK (Forhindrer "blinkende" uendelige fejl)
       fragLoadingMaxRetry: 6,
       fragLoadingRetryDelay: 1000, 
       manifestLoadingMaxRetry: 3
     });
 
-    // Best practice: Attach media first, then load on MEDIA_ATTACHED
     hlsInstance.attachMedia(videoEl);
 
     hlsInstance.on(Hls.Events.MEDIA_ATTACHED, () => {
@@ -184,18 +194,21 @@ function setupVideoBackground() {
         videoEl.play().catch(()=>{});
     });
 
-    // ERROR RECOVERY
+    // ERROR RECOVERY MED RETRY LIMIT (så det ikke blinker uendeligt)
     hlsInstance.on(Hls.Events.ERROR, (_, data) => {
-      diag('hls err: '+data.type+'/'+data.details + (data.fatal?' (fatal)':''));
-      
       if (data.fatal) {
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
-            diag('hls: recovering network (1s delay)...');
-            // Timeout sikrer at vi ikke går i et uendeligt hurtigt loop
-            setTimeout(() => {
-                hlsInstance.startLoad(); 
-            }, 1000);
+            networkErrorCount++;
+            if (networkErrorCount <= 10) {
+                diag(`hls: network error (${networkErrorCount}/10), retrying...`);
+                setTimeout(() => {
+                    hlsInstance.startLoad(); 
+                }, 1500); // Lidt længere delay giver netværket tid
+            } else {
+                diag('hls: FAILED. Check if .ts files exist & CORS is allowed.');
+                hlsInstance.destroy(); // Stop uendeligt loop fuldstændigt
+            }
             break;
           case Hls.ErrorTypes.MEDIA_ERROR:
             diag('hls: recovering media...');
@@ -205,6 +218,10 @@ function setupVideoBackground() {
             diag('hls: unrecoverable, destroying');
             hlsInstance.destroy();
             break;
+        }
+      } else {
+        if (data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR) {
+             diag('hls: chunk load err (non-fatal)...');
         }
       }
     });
@@ -502,6 +519,11 @@ function render() {
           state.lastVideoPlayAttempt = state.elapsedTime;
           videoEl.play().catch(() => {}); // Ignorer fejl for ikke at spamme konsollen
       }
+  }
+
+  // FORCE TEXTURE UPDATE: Sikrer at teksturen opdateres i hvert VR-frame
+  if (videoTex && videoEl && !videoEl.paused && videoEl.readyState >= 2) {
+      videoTex.needsUpdate = true;
   }
 
   // Route eyes → halves of the video, once XR cameras exist
