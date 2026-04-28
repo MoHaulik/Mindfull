@@ -5,27 +5,51 @@
   <title>Bevidst Vejrtrækning XR — NXT/Care</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <style>
-    body { margin:0; overflow:hidden; background:#0a0a0a; font-family:'Segoe UI',system-ui,sans-serif; }
+    body { 
+        margin: 0; 
+        overflow: hidden; 
+        background: #e0f7fa; /* Light ocean blue fallback */
+        font-family: 'Segoe UI', system-ui, sans-serif; 
+    }
     #overlay {
-      position:absolute; inset:0; display:flex; flex-direction:column;
-      align-items:center; justify-content:center; z-index:10;
-      background: radial-gradient(circle at center, #1a1a2e 0%, #000 100%);
+      position: absolute; 
+      inset: 0; 
+      display: flex; 
+      flex-direction: column;
+      align-items: center; 
+      justify-content: center; 
+      z-index: 10;
+      /* Very light, friendly ocean blue gradient */
+      background: radial-gradient(circle at center, #e0f7fa 0%, #b2ebf2 100%);
     }
-    h1 { color:#fff; font-weight:300; margin-bottom:40px; text-shadow:0 4px 20px rgba(100,210,255,0.5); }
     #start-button {
-      padding:20px 40px; font-size:28px; color:#fff; border:none; border-radius:50px;
-      background: linear-gradient(135deg,#182848 0%,#4b6cb7 100%);
-      box-shadow:0 10px 30px rgba(0,0,0,0.5); cursor:pointer; transition:.3s;
-      text-transform:uppercase; letter-spacing:2px;
+      padding: clamp(30px, 5vw, 50px) clamp(50px, 10vw, 100px); 
+      font-size: clamp(28px, 6vw, 56px); 
+      font-weight: bold;
+      color: #ffffff; 
+      border: none; 
+      border-radius: 100px;
+      background: linear-gradient(135deg, #00b4db 0%, #0083b0 100%);
+      box-shadow: 0 15px 40px rgba(0, 131, 176, 0.3); 
+      cursor: pointer; 
+      transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+      text-transform: uppercase; 
+      letter-spacing: 4px;
     }
-    #start-button:hover { background: linear-gradient(135deg,#233a66 0%,#5d81d6 100%); transform:translateY(-2px); }
-    .hint { color:#9bb; margin-top:24px; font-size:14px; letter-spacing:1px; opacity:.7; }
-    .webxr-hidden { display:none !important; }
+    #start-button:hover { 
+      background: linear-gradient(135deg, #00c6ff 0%, #0072ff 100%); 
+      transform: translateY(-5px) scale(1.05); 
+      box-shadow: 0 20px 50px rgba(0, 114, 255, 0.4);
+    }
+    #start-button:active {
+      transform: translateY(2px) scale(0.98);
+      box-shadow: 0 8px 20px rgba(0, 114, 255, 0.3);
+    }
+    .webxr-hidden { display: none !important; }
+    
+    /* Hide the developer diagnostics */
     #diag {
-      position:fixed; left:8px; bottom:8px; z-index:9999; max-width:90vw;
-      font:12px/1.4 -apple-system,Menlo,monospace; color:#9be7c4;
-      background:rgba(0,0,0,.55); padding:6px 10px; border-radius:8px;
-      pointer-events:none; white-space:pre-wrap;
+      display: none; 
     }
   </style>
   <!-- HLS.js — Quest browser is Chromium and has no native HLS -->
@@ -36,9 +60,8 @@
 </head>
 <body>
   <div id="overlay">
-    <h1>Bevidst Vejrtrækning</h1>
-    <button id="start-button">Start session</button>
-    <div class="hint">Klap hænderne sammen i 6 sek. for at afslutte</div>
+    <!-- Just the big start button, all other text removed -->
+    <button id="start-button">START</button>
   </div>
   <div id="diag">video: idle</div>
 
