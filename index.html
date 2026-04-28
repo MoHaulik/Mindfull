@@ -57,7 +57,8 @@ const state = {
   clock:new THREE.Clock(), elapsedTime:0, phase:'INTRO',
   lastCameraPos:new THREE.Vector3(), timeSinceLastMove:10.0,
   baseEnvOpacity:0.0, currentEnvOpacity:0.0,
-  clapStart:0, layersConfigured:false
+  clapStart:0, layersConfigured:false,
+  lastVideoPlayAttempt: 0 // Bruges til Watchdog
 };
 
 let camera, scene, renderer;
@@ -162,7 +163,12 @@ function setupVideoBackground() {
       lowLatencyMode: false, 
       backBufferLength: 30,
       maxBufferLength: 15,   // Keeps memory footprint low on mobile VR
-      maxMaxBufferLength: 30 
+      maxMaxBufferLength: 30,
+      
+      // INDBYGGET RETRY LOGIK (Forhindrer "blinkende" uendelige fejl)
+      fragLoadingMaxRetry: 6,
+      fragLoadingRetryDelay: 1000, 
+      manifestLoadingMaxRetry: 3
     });
 
     // Best practice: Attach media first, then load on MEDIA_ATTACHED
@@ -173,17 +179,23 @@ function setupVideoBackground() {
       hlsInstance.loadSource(VIDEO_URL);
     });
 
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => diag('hls: manifest parsed'));
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+        diag('hls: manifest parsed');
+        videoEl.play().catch(()=>{});
+    });
 
-    // ERROR RECOVERY: This is what catches the fragLoadError and forces it to retry
+    // ERROR RECOVERY
     hlsInstance.on(Hls.Events.ERROR, (_, data) => {
       diag('hls err: '+data.type+'/'+data.details + (data.fatal?' (fatal)':''));
       
       if (data.fatal) {
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
-            diag('hls: recovering network...');
-            hlsInstance.startLoad(); // Crucial: Restarts downloading fragments automatically
+            diag('hls: recovering network (1s delay)...');
+            // Timeout sikrer at vi ikke går i et uendeligt hurtigt loop
+            setTimeout(() => {
+                hlsInstance.startLoad(); 
+            }, 1000);
             break;
           case Hls.ErrorTypes.MEDIA_ERROR:
             diag('hls: recovering media...');
@@ -452,6 +464,14 @@ async function startXR() {
       if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying) oceanSound.play();
       if (videoEl && videoEl.paused) videoEl.play().catch(()=>{});
     });
+    
+    // Tving video til at afspille et øjeblik EFTER sessionen er startet (WebXR blokerer/pauser ofte under transition)
+    setTimeout(() => {
+        if (videoEl && videoEl.paused) {
+            videoEl.play().catch(e => diag("XR delayed play failed: " + e));
+        }
+    }, 800);
+
     state.isPlaying = true;
     state.elapsedTime = 0; state.clapStart = 0;
     state.clock.start();
@@ -475,6 +495,14 @@ function render() {
   if (!state.isPlaying) return;
   const dt = state.clock.getDelta();
   state.elapsedTime += dt;
+
+  // Watchdog: Hvis WebXR har pauset videoen utilsigtet, forsøg at starte den igen (hvert 2. sekund)
+  if (videoEl && videoEl.paused && videoEl.readyState >= 2) {
+      if (state.elapsedTime - state.lastVideoPlayAttempt > 2.0) {
+          state.lastVideoPlayAttempt = state.elapsedTime;
+          videoEl.play().catch(() => {}); // Ignorer fejl for ikke at spamme konsollen
+      }
+  }
 
   // Route eyes → halves of the video, once XR cameras exist
   if (!state.layersConfigured && state.xrSession) {
