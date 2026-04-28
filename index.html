@@ -41,6 +41,7 @@
     <div class="hint">Klap hænderne sammen i 6 sek. for at afslutte</div>
   </div>
   <div id="diag">video: idle</div>
+
 <script type="module">
 import * as THREE from 'three';
 
@@ -97,9 +98,6 @@ function init() {
   addEventListener('resize', onResize);
 }
 
-// IMPORTANT: do everything that needs a user gesture SYNCHRONOUSLY here,
-// BEFORE any await — otherwise the gesture is consumed by requestSession
-// and Quest's autoplay policy blocks video.play() / audio resume.
 function onStartClick() {
   // 1. Resume audio context + start ocean sound
   if (audioListener && audioListener.context.state === 'suspended') audioListener.context.resume();
@@ -157,12 +155,48 @@ function setupVideoBackground() {
 
   if (window.Hls && Hls.isSupported()) {
     diag('hls.js v'+Hls.version+' — loading '+VIDEO_URL);
-    hlsInstance = new Hls({ lowLatencyMode:false, backBufferLength:30 });
-    hlsInstance.on(Hls.Events.ERROR, (_, data) =>
-      diag('hls error: '+data.type+'/'+data.details + (data.fatal?' (fatal)':'')));
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => diag('hls: manifest parsed'));
-    hlsInstance.loadSource(VIDEO_URL);
+    
+    // --- META QUEST 3 SPECIFIC HLS CONFIGURATION ---
+    hlsInstance = new Hls({ 
+      enableWorker: false,   // Fixes Blob URL/Worker strict-origin blocks on Quest
+      lowLatencyMode: false, 
+      backBufferLength: 30,
+      maxBufferLength: 15,   // Keeps memory footprint low on mobile VR
+      maxMaxBufferLength: 30 
+    });
+
+    // Best practice: Attach media first, then load on MEDIA_ATTACHED
     hlsInstance.attachMedia(videoEl);
+
+    hlsInstance.on(Hls.Events.MEDIA_ATTACHED, () => {
+      diag('hls: media attached, loading source');
+      hlsInstance.loadSource(VIDEO_URL);
+    });
+
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => diag('hls: manifest parsed'));
+
+    // ERROR RECOVERY: This is what catches the fragLoadError and forces it to retry
+    hlsInstance.on(Hls.Events.ERROR, (_, data) => {
+      diag('hls err: '+data.type+'/'+data.details + (data.fatal?' (fatal)':''));
+      
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            diag('hls: recovering network...');
+            hlsInstance.startLoad(); // Crucial: Restarts downloading fragments automatically
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            diag('hls: recovering media...');
+            hlsInstance.recoverMediaError();
+            break;
+          default:
+            diag('hls: unrecoverable, destroying');
+            hlsInstance.destroy();
+            break;
+        }
+      }
+    });
+
   } else if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
     diag('native HLS — '+VIDEO_URL);
     videoEl.src = VIDEO_URL;
