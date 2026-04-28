@@ -21,7 +21,15 @@
     #start-button:hover { background: linear-gradient(135deg,#233a66 0%,#5d81d6 100%); transform:translateY(-2px); }
     .hint { color:#9bb; margin-top:24px; font-size:14px; letter-spacing:1px; opacity:.7; }
     .webxr-hidden { display:none !important; }
+    #diag {
+      position:fixed; left:8px; bottom:8px; z-index:9999; max-width:90vw;
+      font:12px/1.4 -apple-system,Menlo,monospace; color:#9be7c4;
+      background:rgba(0,0,0,.55); padding:6px 10px; border-radius:8px;
+      pointer-events:none; white-space:pre-wrap;
+    }
   </style>
+  <!-- HLS.js — Quest browser is Chromium and has no native HLS -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
   <script type="importmap">
     { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
   </script>
@@ -32,87 +40,170 @@
     <button id="start-button">Start session</button>
     <div class="hint">Klap hænderne sammen i 6 sek. for at afslutte</div>
   </div>
+  <div id="diag">video: idle</div>
 <script type="module">
 import * as THREE from 'three';
 
-// ─── CONFIG (NXT/Care WebXR Standards v1.3) ─────────────────────────────────
-const INTRO_DURATION     = 60;       // 1 min introduktion
-const BREATHING_DURATION = 360;      // 6 min vejrtrækning
-const CLAP_DIST          = 0.15;     // 15 cm — Section 2
-const CLAP_TIME          = 6000;     // 6 sek — Section 2
+// ─── CONFIG (NXT/Care v1.3) ─────────────────────────────────────────────────
+const INTRO_DURATION     = 60;
+const BREATHING_DURATION = 360;
+const CLAP_DIST          = 0.15;
+const CLAP_TIME          = 6000;
+const VIDEO_URL          = 'baggrund.m3u8';
 
 const state = {
   xrSession:null, isPlaying:false,
   clock:new THREE.Clock(), elapsedTime:0, phase:'INTRO',
   lastCameraPos:new THREE.Vector3(), timeSinceLastMove:10.0,
   baseEnvOpacity:0.0, currentEnvOpacity:0.0,
-  clapStart:0
+  clapStart:0, layersConfigured:false
 };
 
 let camera, scene, renderer;
-let envSphere, envMaterial;
+let leftSphere, rightSphere, leftMat, rightMat;
+let videoEl, videoTex, hlsInstance;
 let orbGroup, orbMesh, orbLight, uiMesh, uiCtx, uiTex;
 let clapHUD;
 const controllers = [];
 let audioListener, oceanSound;
 let currentTitle = "", currentInstruction = "";
 
+const diagEl = document.getElementById('diag');
+function diag(msg) { if (diagEl) diagEl.textContent = msg; console.log('[diag]', msg); }
+
 // ─── INIT ───────────────────────────────────────────────────────────────────
 function init() {
   scene = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 100);
-  scene.add(camera);                                   // required so head-locked HUD renders
+  camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 200);
+  camera.layers.enable(1);                             // mono fallback sees left-eye sphere
+  scene.add(camera);
 
   renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, powerPreference:'high-performance' });
   renderer.setPixelRatio(devicePixelRatio);
   renderer.setSize(innerWidth, innerHeight);
-  renderer.setClearColor(0x000000, 0);                 // Section 4: transparent for AR passthrough
+  renderer.setClearColor(0x000000, 0);                 // Section 4: transparent for AR
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.xr.enabled = true;
   document.body.appendChild(renderer.domElement);
 
   setupLighting();
-  setupEnvironmentFade();
+  setupVideoBackground();
   setupOrb();
   setupClapHUD();
   setupControllers();
   setupAudio();
 
-  document.getElementById('start-button').addEventListener('click', startXR);
+  document.getElementById('start-button').addEventListener('click', onStartClick);
   addEventListener('resize', onResize);
 }
 
-// ─── SECTION 4 — AR PASSTHROUGH LIGHTING ────────────────────────────────────
+// IMPORTANT: do everything that needs a user gesture SYNCHRONOUSLY here,
+// BEFORE any await — otherwise the gesture is consumed by requestSession
+// and Quest's autoplay policy blocks video.play() / audio resume.
+function onStartClick() {
+  // 1. Resume audio context + start ocean sound
+  if (audioListener && audioListener.context.state === 'suspended') audioListener.context.resume();
+  if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying) {
+    try { oceanSound.play(); diag('audio: playing'); } catch(e) { console.warn(e); }
+  }
+  // 2. Start the video — muted+playsInline allows immediate play
+  if (videoEl) {
+    const p = videoEl.play();
+    if (p && p.then) p.then(()=>diag('video: playing  '+videoEl.videoWidth+'x'+videoEl.videoHeight))
+                     .catch(err=>diag('video play() rejected: '+err.message));
+  }
+  // 3. Now hand off to async XR
+  startXR();
+}
+
+// ─── SECTION 4 — AR LIGHTING ────────────────────────────────────────────────
 function setupLighting() {
-  scene.add(new THREE.AmbientLight(0xffffff, 1.6));    // ≥ 1.5 minimum
+  scene.add(new THREE.AmbientLight(0xffffff, 1.6));
   const key = new THREE.DirectionalLight(0xffffff, 1.2);
   key.position.set(1, 4, 2); scene.add(key);
   const rim = new THREE.DirectionalLight(0x88aaff, 0.5);
   rim.position.set(-2, 1, -1); scene.add(rim);
 }
 
-// ─── ENVIRONMENT FADE ───────────────────────────────────────────────────────
-function setupEnvironmentFade() {
-  const geo = new THREE.SphereGeometry(50, 32, 32);
-  geo.scale(-1, 1, 1);
-  envMaterial = new THREE.ShaderMaterial({
-    transparent:true, depthWrite:false,
-    uniforms:{ uTime:{value:0}, uOpacity:{value:0} },
-    vertexShader:`varying vec3 vP; varying vec2 vU;
-      void main(){ vU=uv; vP=position;
-        gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
-    fragmentShader:`uniform float uTime,uOpacity; varying vec3 vP; varying vec2 vU;
-      void main(){
-        vec3 t=vec3(0.18,0.45,0.55), b=vec3(0.05,0.1,0.15);
-        float m=smoothstep(-50.0,50.0,vP.y);
-        vec3 c=mix(b,t,m); c+=sin(vU.y*10.0+uTime*0.1)*0.05;
-        gl_FragColor=vec4(c,uOpacity); }`
-  });
-  envSphere = new THREE.Mesh(geo, envMaterial);
-  envSphere.renderOrder = -1;
-  scene.add(envSphere);
+// ─── 360° STEREO TOP-BOTTOM HLS BACKGROUND ──────────────────────────────────
+function remapV(geo, vMin, vMax) {
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setY(i, vMin + uv.getY(i) * (vMax - vMin));
+  uv.needsUpdate = true;
 }
 
-// ─── ORB + INTERNAL TEXT (Danish, fits inside the sphere) ───────────────────
+function setupVideoBackground() {
+  videoEl = document.createElement('video');
+  videoEl.crossOrigin = 'anonymous';
+  videoEl.loop = true;
+  videoEl.muted = true;
+  videoEl.defaultMuted = true;
+  videoEl.autoplay = true;
+  videoEl.playsInline = true;
+  videoEl.preload = 'auto';
+  videoEl.setAttribute('webkit-playsinline','');
+  videoEl.setAttribute('playsinline','');
+
+  videoEl.addEventListener('loadedmetadata', () =>
+    diag('video: meta '+videoEl.videoWidth+'x'+videoEl.videoHeight));
+  videoEl.addEventListener('canplay', () => {
+    diag('video: canplay');
+    videoEl.play().catch(e => diag('video canplay-play rejected: '+e.message));
+  });
+  videoEl.addEventListener('playing', () => diag('video: PLAYING'));
+  videoEl.addEventListener('error', () =>
+    diag('video error: '+(videoEl.error && videoEl.error.message || 'unknown')));
+  videoEl.addEventListener('stalled', () => diag('video: stalled'));
+
+  if (window.Hls && Hls.isSupported()) {
+    diag('hls.js v'+Hls.version+' — loading '+VIDEO_URL);
+    hlsInstance = new Hls({ lowLatencyMode:false, backBufferLength:30 });
+    hlsInstance.on(Hls.Events.ERROR, (_, data) =>
+      diag('hls error: '+data.type+'/'+data.details + (data.fatal?' (fatal)':'')));
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => diag('hls: manifest parsed'));
+    hlsInstance.loadSource(VIDEO_URL);
+    hlsInstance.attachMedia(videoEl);
+  } else if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+    diag('native HLS — '+VIDEO_URL);
+    videoEl.src = VIDEO_URL;
+  } else {
+    diag('HLS NOT SUPPORTED in this browser');
+  }
+
+  videoTex = new THREE.VideoTexture(videoEl);
+  videoTex.colorSpace = THREE.SRGBColorSpace;
+  videoTex.minFilter = THREE.LinearFilter;
+  videoTex.magFilter = THREE.LinearFilter;
+  videoTex.generateMipmaps = false;
+
+  // Inverted sphere (we sit inside it)
+  const base = new THREE.SphereGeometry(80, 64, 32);
+  base.scale(-1, 1, 1);
+
+  // LEFT eye → top half of frame (UV.y 0.5 → 1.0)
+  const lGeo = base.clone();
+  remapV(lGeo, 0.5, 1.0);
+  leftMat = new THREE.MeshBasicMaterial({
+    map:videoTex, transparent:true, opacity:0, depthWrite:false, toneMapped:false
+  });
+  leftSphere = new THREE.Mesh(lGeo, leftMat);
+  leftSphere.layers.set(1);
+  leftSphere.renderOrder = -1;
+  scene.add(leftSphere);
+
+  // RIGHT eye → bottom half (UV.y 0 → 0.5)
+  const rGeo = base.clone();
+  remapV(rGeo, 0.0, 0.5);
+  rightMat = new THREE.MeshBasicMaterial({
+    map:videoTex, transparent:true, opacity:0, depthWrite:false, toneMapped:false
+  });
+  rightSphere = new THREE.Mesh(rGeo, rightMat);
+  rightSphere.layers.set(2);
+  rightSphere.renderOrder = -1;
+  scene.add(rightSphere);
+}
+
+// ─── ORB + INTERNAL TEXT ────────────────────────────────────────────────────
 function setupOrb() {
   orbGroup = new THREE.Group();
   orbGroup.position.set(0, -0.1, -1.5);
@@ -127,12 +218,9 @@ function setupOrb() {
     })
   );
   orbGroup.add(orbMesh);
-
   orbLight = new THREE.PointLight(0x64d2ff, 1.0, 4.0);
   orbGroup.add(orbLight);
 
-  // Canvas-on-plane sized so corners stay INSIDE the 0.4 sphere radius.
-  // corner dist = sqrt(0.23² + 0.23² + 0.10²) ≈ 0.34  <  0.40  ✓
   const canvas = document.createElement('canvas');
   canvas.width = 1024; canvas.height = 1024;
   uiCtx = canvas.getContext('2d');
@@ -151,7 +239,7 @@ function setupOrb() {
   updateUIText('Mavevejrtrækning', 'Gør dig klar...');
 }
 
-// ─── TEXT WRAPPING + AUTO-FIT (so Danish copy stays inside the orb) ─────────
+// ─── TEXT WRAP + FIT ────────────────────────────────────────────────────────
 function wrapLines(ctx, text, maxW) {
   const out = [];
   for (const para of String(text).split('\n')) {
@@ -173,25 +261,20 @@ function fitText(ctx, text, maxW, maxH, weight, baseSize, minSize) {
     ctx.font = `${weight} ${s}px system-ui,-apple-system,"Segoe UI",sans-serif`;
     const lines = wrapLines(ctx, text, maxW);
     const lh = s * 1.25;
-    const fits = lines.every(l => ctx.measureText(l).width <= maxW)
-              && lines.length * lh <= maxH;
-    if (fits) return { lines, size:s, lh };
+    if (lines.every(l => ctx.measureText(l).width <= maxW) && lines.length * lh <= maxH)
+      return { lines, size:s, lh };
     s -= 4;
   }
   ctx.font = `${weight} ${minSize}px system-ui,sans-serif`;
   return { lines:wrapLines(ctx,text,maxW), size:minSize, lh:minSize*1.25 };
 }
-
 function updateUIText(title, instruction) {
   if (currentTitle === title && currentInstruction === instruction) return;
   currentTitle = title; currentInstruction = instruction;
-
   uiCtx.clearRect(0, 0, 1024, 1024);
   uiCtx.textAlign = 'center'; uiCtx.textBaseline = 'middle';
-
   const MAX_W = 720, MAX_H = 720, GAP = 30;
   let tData = null, iData = null, totalH = 0;
-
   if (title) {
     tData = fitText(uiCtx, title, MAX_W, instruction ? 240 : MAX_H, 'bold', 100, 44);
     totalH += tData.lines.length * tData.lh;
@@ -203,7 +286,6 @@ function updateUIText(title, instruction) {
     if (title) totalH += GAP;
     totalH += iData.lines.length * iData.lh;
   }
-
   let y = 512 - totalH / 2;
   if (tData) {
     uiCtx.fillStyle = '#ffffff';
@@ -223,7 +305,7 @@ function updateUIText(title, instruction) {
   uiTex.needsUpdate = true;
 }
 
-// ─── SECTION 3 — WHITE-GLASS CLAP HUD (v1.3) ────────────────────────────────
+// ─── SECTION 3 — WHITE-GLASS CLAP HUD ───────────────────────────────────────
 function roundRect(ctx, x, y, w, h, r) {
   const rr = Math.min(r, w/2, h/2);
   ctx.beginPath();
@@ -236,14 +318,14 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 function setupClapHUD() {
   clapHUD = new THREE.Group();
-  clapHUD.position.set(0, 0.45, -1.5);                 // head-locked, just above gaze
+  clapHUD.position.set(0, 0.45, -1.5);
   const c = document.createElement('canvas');
   c.width = 1024; c.height = 220;
   const tex = new THREE.CanvasTexture(c);
   tex.minFilter = THREE.LinearFilter;
   const mesh = new THREE.Mesh(
     new THREE.PlaneGeometry(0.7, 0.151),
-    new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthTest:false })  // unlit per Section 4
+    new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthTest:false })
   );
   mesh.renderOrder = 999;
   clapHUD.add(mesh);
@@ -257,32 +339,22 @@ function drawClapHUD() {
   const { ctx, tex } = clapHUD.userData;
   const W = 1024, H = 220, R = 110;
   ctx.clearRect(0, 0, W, H);
-
-  // 1. Sky-blue elevation shadow
   ctx.shadowColor='rgba(14,165,233,0.22)'; ctx.shadowBlur=28; ctx.shadowOffsetY=10;
-  // 2. White-glass card (rgba(255,255,255,0.92), full pill)
   ctx.fillStyle='rgba(255,255,255,0.92)';
   roundRect(ctx, 12, 8, W-24, H-24, R); ctx.fill();
   ctx.shadowColor='transparent'; ctx.shadowBlur=0; ctx.shadowOffsetY=0;
-  // 3. Inner highlight border
   ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=2;
   roundRect(ctx, 13, 9, W-26, H-26, R-1); ctx.stroke();
-
   const elapsed = Date.now() - state.clapStart;
   const prog    = Math.min(1, elapsed / CLAP_TIME);
   const remain  = Math.max(0, Math.ceil((CLAP_TIME - elapsed) / 1000));
-
-  // 4. Dark-slate text, no shadow — Danish per spec
   ctx.fillStyle='#0f172a';
   ctx.font='800 52px -apple-system,"SF Pro Rounded","Segoe UI",Helvetica,sans-serif';
   ctx.textAlign='center'; ctx.textBaseline='middle';
   ctx.fillText(`👏 Hold sammen i ${remain}s for at lukke`, W/2, 78);
-
-  // 5. Bar track
   const bx=64, by=142, bw=W-128, bh=36, br=18;
   ctx.fillStyle='rgba(14,165,233,0.12)';
   roundRect(ctx, bx, by, bw, bh, br); ctx.fill();
-  // 6. Sky-blue gradient fill
   if (prog > 0) {
     const g = ctx.createLinearGradient(bx, 0, bx+bw, 0);
     g.addColorStop(0, '#bae6fd'); g.addColorStop(1, '#0ea5e9');
@@ -304,7 +376,7 @@ function checkClap() {
   if (controllers.length < 2) { state.clapStart = 0; return; }
   const c1 = controllers[0], c2 = controllers[1];
   if (c1.position.lengthSq() === 0 && c2.position.lengthSq() === 0) {
-    state.clapStart = 0; return;                       // failsafe: untracked
+    state.clapStart = 0; return;
   }
   if (c1.position.distanceTo(c2.position) <= CLAP_DIST) {
     if (!state.clapStart) state.clapStart = Date.now();
@@ -319,9 +391,9 @@ function setupAudio() {
   oceanSound = new THREE.Audio(audioListener);
   new THREE.AudioLoader().load(
     'https://actions.google.com/sounds/v1/water/waves_crashing_on_rock_beach.ogg',
-    b => { oceanSound.setBuffer(b); oceanSound.setLoop(true); oceanSound.setVolume(0); },
+    b => { oceanSound.setBuffer(b); oceanSound.setLoop(true); oceanSound.setVolume(0); diag('audio: buffer loaded'); },
     undefined,
-    e => console.warn('Lyd kunne ikke indlæses:', e)
+    e => diag('audio load err: '+(e && e.message || 'unknown'))
   );
 }
 
@@ -338,9 +410,13 @@ async function startXR() {
     renderer.xr.setReferenceSpaceType('local');
     renderer.xr.setSession(session);
     state.xrSession = session;
+    state.layersConfigured = false;
+
+    // Backup: re-trigger media on controller select if anything was blocked
     session.addEventListener('select', () => {
       if (audioListener.context.state === 'suspended') audioListener.context.resume();
-      if (oceanSound.buffer && !oceanSound.isPlaying) oceanSound.play();
+      if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying) oceanSound.play();
+      if (videoEl && videoEl.paused) videoEl.play().catch(()=>{});
     });
     state.isPlaying = true;
     state.elapsedTime = 0; state.clapStart = 0;
@@ -354,6 +430,7 @@ function endXR() {
   state.isPlaying = false;
   document.getElementById('overlay').classList.remove('webxr-hidden');
   if (oceanSound && oceanSound.isPlaying) oceanSound.pause();
+  if (videoEl) videoEl.pause();
   renderer.setAnimationLoop(null);
   state.xrSession = null;
   setTimeout(() => location.reload(), 300);
@@ -365,10 +442,20 @@ function render() {
   const dt = state.clock.getDelta();
   state.elapsedTime += dt;
 
-  if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying
-      && audioListener.context.state === 'running') oceanSound.play();
+  // Route eyes → halves of the video, once XR cameras exist
+  if (!state.layersConfigured && state.xrSession) {
+    const xrCam = renderer.xr.getCamera();
+    if (xrCam.cameras && xrCam.cameras.length >= 2) {
+      xrCam.cameras[0].layers.enable(1);
+      xrCam.cameras[1].layers.enable(2);
+      state.layersConfigured = true;
+    } else if (xrCam.cameras && xrCam.cameras.length === 1) {
+      xrCam.cameras[0].layers.enable(1);
+      state.layersConfigured = true;
+    }
+  }
 
-  // movement -> environment fade
+  // movement → environment fade
   if (state.lastCameraPos.lengthSq() === 0 && camera.position.lengthSq() > 0)
     state.lastCameraPos.copy(camera.position);
   const dx = camera.position.x - state.lastCameraPos.x;
@@ -377,33 +464,34 @@ function render() {
   state.timeSinceLastMove = speed > 0.25 ? 0 : state.timeSinceLastMove + dt;
   state.lastCameraPos.copy(camera.position);
 
-  // Phase routing
+  // phase routing
   if (state.elapsedTime < INTRO_DURATION) handleIntroPhase();
   else if (state.elapsedTime < INTRO_DURATION + BREATHING_DURATION) handleBreathingPhase();
   else handleCompletionPhase();
 
-  // Env fade with movement
+  // env fade — drives BOTH the 360 video opacity AND the ocean volume
   const moving = state.timeSinceLastMove < 10.0;
   const target = moving ? 0.0 : state.baseEnvOpacity;
   const fade = moving ? 4.0 : 0.5;
   state.currentEnvOpacity += (target - state.currentEnvOpacity) * fade * dt;
-  envMaterial.uniforms.uTime.value = state.elapsedTime;
-  envMaterial.uniforms.uOpacity.value = state.currentEnvOpacity;
-  if (oceanSound && oceanSound.isPlaying) oceanSound.setVolume(state.currentEnvOpacity);
+  if (leftMat)  leftMat.opacity  = state.currentEnvOpacity;
+  if (rightMat) rightMat.opacity = state.currentEnvOpacity;
+  // Always update audio volume — don't gate on isPlaying so the fade is consistent
+  if (oceanSound) oceanSound.setVolume(state.currentEnvOpacity);
 
-  // Float + slow rotation
+  // float + slow rotation
   orbGroup.position.y = -0.1 + Math.sin(state.elapsedTime * 0.5) * 0.03;
   orbMesh.rotation.y += 0.1 * dt;
   orbMesh.rotation.z += 0.05 * dt;
 
-  // NXT/Care Section 2 + 3 — every frame
+  // Section 2 + 3 every frame
   checkClap();
   drawClapHUD();
 
   renderer.render(scene, camera);
 }
 
-// ─── PHASE HANDLERS (Danish copy) ───────────────────────────────────────────
+// ─── PHASE HANDLERS ─────────────────────────────────────────────────────────
 function handleIntroPhase() {
   state.phase = 'INTRO'; state.baseEnvOpacity = 0.0;
   let instr;
@@ -411,7 +499,6 @@ function handleIntroPhase() {
   else if (state.elapsedTime < 35) instr = "Mærk din naturlige vejrtrækning.\nMaven skal udvide sig, når du ånder ind.";
   else                             instr = "Vi trækker vejret sammen.\nInd i 4 sek, ud i 6 sek.";
   updateUIText('Mavevejrtrækning', instr);
-
   orbGroup.scale.lerp(new THREE.Vector3(2.4, 2.4, 2.4), 0.03);
   orbMesh.material.emissiveIntensity = THREE.MathUtils.lerp(orbMesh.material.emissiveIntensity, 0.3, 0.05);
   orbLight.intensity = THREE.MathUtils.lerp(orbLight.intensity, 1.0, 0.05);
