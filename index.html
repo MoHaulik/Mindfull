@@ -21,28 +21,27 @@
   <div id="diag">video: idle</div>
 <script type="module">
 import * as THREE from 'three';
-// ─── CONFIG (NXT/Care v1.4) ─────────────────────────────────────────────────
+
+// ─── CONFIG (NXT/Care v1.5) ─────────────────────────────────────────────────
 const INTRO_DURATION     = 45;                  // tightened from 60
 const INTRO_SEGMENTS     = [12, 27, 45];        // segment end times
 const BREATHING_DURATION = 360;
 const TOTAL_LABEL        = 'ca. 7 min';         // 45 + 360 ≈ 7 min
 const CLAP_DIST          = 0.15;
 const CLAP_TIME          = 6000;
-// Anti-false-positive geometry: hands must lie inside a forward cone from the head.
-// Resting on chest/stomach is BELOW the head → outside the cone → no trigger.
-// Works seated, standing, and lying down (cone follows head orientation).
 const CLAP_FORWARD_MIN   = 0.20;                // min head-forward component (m)
 const CLAP_FORWARD_COS   = 0.70;                // cos(angle) from head-forward (≈45°)
 const VIDEO_URL          = 'baggrund.m3u8';
 
 const state = {
-  xrSession:null, isPlaying:false,
+  xrSession:null, isPlaying:false, audioAllowed:false,
   clock:new THREE.Clock(), elapsedTime:0, phase:'INTRO',
   lastCameraPos:new THREE.Vector3(), timeSinceLastMove:10.0,
   baseEnvOpacity:0.0, currentEnvOpacity:0.0,
   clapStart:0, layersConfigured:false,
   lastVideoPlayAttempt:0, lastProgressDraw:-1
 };
+
 let camera, scene, renderer;
 let leftSphere, rightSphere, leftMat, rightMat;
 let videoEl, videoTex, hlsInstance;
@@ -63,13 +62,15 @@ function init() {
   camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 200);
   camera.layers.enable(1);
   scene.add(camera);
+  
   renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, powerPreference:'high-performance' });
-  renderer.setPixelRatio(devicePixelRatio);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap pixel ratio to save frames
   renderer.setSize(innerWidth, innerHeight);
   renderer.setClearColor(0x000000, 0);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.xr.enabled = true;
   document.body.appendChild(renderer.domElement);
+  
   setupLighting();
   setupVideoBackground();
   setupOrb();
@@ -77,28 +78,39 @@ function init() {
   setupClapHUD();
   setupControllers();
   setupAudio();
+  
   document.getElementById('start-button').addEventListener('click', onStartClick);
   addEventListener('resize', onResize);
 }
+
 function onStartClick() {
+  state.audioAllowed = true;
   if (audioListener && audioListener.context.state === 'suspended') audioListener.context.resume();
-  if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying) { try { oceanSound.play(); diag('audio: playing'); } catch(e){ console.warn(e); } }
+  
+  // Safe play if it loaded before the click
+  if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying) { 
+    try { oceanSound.play(); diag('audio: playing'); } catch(e){ console.warn(e); } 
+  }
+  
   if (videoEl) {
     const p = videoEl.play();
     if (p && p.then) p.then(()=>diag('video: playing')).catch(err=>diag('video play() rejected: '+err.message));
   }
   startXR();
 }
+
 function setupLighting() {
   scene.add(new THREE.AmbientLight(0xffffff, 1.6));
   const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(1,4,2); scene.add(key);
   const rim = new THREE.DirectionalLight(0x88aaff, 0.5); rim.position.set(-2,1,-1); scene.add(rim);
 }
+
 function remapV(geo, vMin, vMax) {
   const uv = geo.attributes.uv;
   for (let i = 0; i < uv.count; i++) uv.setY(i, vMin + uv.getY(i)*(vMax - vMin));
   uv.needsUpdate = true;
 }
+
 function setupVideoBackground() {
   videoEl = document.createElement('video');
   videoEl.loop = true; videoEl.muted = true; videoEl.defaultMuted = true;
@@ -109,6 +121,7 @@ function setupVideoBackground() {
   document.body.appendChild(videoEl);
   videoEl.addEventListener('playing', ()=>diag('video: PLAYING'));
   videoEl.addEventListener('error', ()=>diag('video error: '+(videoEl.error && videoEl.error.message || 'unknown')));
+  
   if (window.Hls && Hls.isSupported()) {
     hlsInstance = new Hls({ enableWorker:false, lowLatencyMode:false, backBufferLength:30, maxBufferLength:15, fragLoadingMaxRetry:6, fragLoadingRetryDelay:1000 });
     hlsInstance.attachMedia(videoEl);
@@ -127,47 +140,58 @@ function setupVideoBackground() {
     videoEl.crossOrigin = 'anonymous';
     videoEl.src = VIDEO_URL;
   }
+  
   videoTex = new THREE.VideoTexture(videoEl);
   videoTex.colorSpace = THREE.SRGBColorSpace;
   videoTex.minFilter = THREE.LinearFilter; videoTex.magFilter = THREE.LinearFilter;
   videoTex.generateMipmaps = false;
+  
   const base = new THREE.SphereGeometry(80, 64, 32); base.scale(-1,1,1);
   const lGeo = base.clone(); remapV(lGeo, 0.5, 1.0);
   leftMat = new THREE.MeshBasicMaterial({ map:videoTex, transparent:true, opacity:0, depthWrite:false, toneMapped:false });
   leftSphere = new THREE.Mesh(lGeo, leftMat); leftSphere.layers.set(1); leftSphere.renderOrder = -1; scene.add(leftSphere);
+  
   const rGeo = base.clone(); remapV(rGeo, 0.0, 0.5);
   rightMat = new THREE.MeshBasicMaterial({ map:videoTex, transparent:true, opacity:0, depthWrite:false, toneMapped:false });
   rightSphere = new THREE.Mesh(rGeo, rightMat); rightSphere.layers.set(2); rightSphere.renderOrder = -1; scene.add(rightSphere);
 }
+
 function setupOrb() {
   orbGroup = new THREE.Group();
-  orbGroup.position.set(0, -0.1, -1.5);
+  // Moved further away (from -1.5 to -2.0)
+  orbGroup.position.set(0, -0.1, -2.0);
   scene.add(orbGroup);
+  
   orbMesh = new THREE.Mesh(
     new THREE.SphereGeometry(0.4, 64, 64),
     new THREE.MeshPhysicalMaterial({ color:0x88ccff, emissive:0x051025, roughness:0.05, metalness:0.1, transmission:0.85, transparent:true, ior:1.3, thickness:0.5, clearcoat:1.0, clearcoatRoughness:0.1 })
   );
   orbGroup.add(orbMesh);
+  
   orbLight = new THREE.PointLight(0x64d2ff, 1.0, 4.0);
   orbGroup.add(orbLight);
+  
   const canvas = document.createElement('canvas'); canvas.width = 1024; canvas.height = 1024;
   uiCtx = canvas.getContext('2d');
   uiTex = new THREE.CanvasTexture(canvas); uiTex.minFilter = THREE.LinearFilter;
+  
   uiMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.46, 0.46),
+    new THREE.PlaneGeometry(0.55, 0.55), // Made slightly larger to compensate for group scale down
     new THREE.MeshBasicMaterial({ map:uiTex, transparent:true, depthTest:false, depthWrite:false, side:THREE.DoubleSide })
   );
   uiMesh.position.set(0, 0, 0.10); uiMesh.renderOrder = 1;
   orbGroup.add(uiMesh);
+  
   updateUIText('Mavevejrtrækning', 'Gør dig klar...');
 }
-// Depleting progress ring around the text plane (separate cached canvas → cheap to redraw).
+
 function setupProgress() {
   const c = document.createElement('canvas'); c.width = 512; c.height = 512;
   progCtx = c.getContext('2d');
   progTex = new THREE.CanvasTexture(c); progTex.minFilter = THREE.LinearFilter; progTex.generateMipmaps = false;
+  
   progMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.50, 0.50),
+    new THREE.PlaneGeometry(0.60, 0.60), // Increased slightly to comfortably wrap the text
     new THREE.MeshBasicMaterial({ map:progTex, transparent:true, depthTest:false, depthWrite:false })
   );
   progMesh.position.set(0, 0, 0.099);
@@ -175,34 +199,44 @@ function setupProgress() {
   progMesh.visible = false;
   orbGroup.add(progMesh);
 }
+
 function drawProgress(p) {
-  // ~15 Hz update keeps the Quest 3 GPU happy
-  if (state.elapsedTime - state.lastProgressDraw < 0.066) return;
+  // Limited to ~30Hz to fix flickers / save performance
+  if (state.elapsedTime - state.lastProgressDraw < 0.033) return;
   state.lastProgressDraw = state.elapsedTime;
-  const W = 512, H = 512;
+  
+  const W = 512, H = 512, cx = W/2, cy = H/2, r = 230;
   progCtx.clearRect(0, 0, W, H);
+  
   if (p <= 0) { progTex.needsUpdate = true; return; }
-  const m = 24, x = m, y = m, w = W - 2*m, h = H - 2*m, r = 90;
-  const perim = 2*(w - 2*r) + 2*(h - 2*r) + 2*Math.PI*r;
-  const visible = perim * Math.min(1, Math.max(0, p));
-  progCtx.lineCap = 'round'; progCtx.lineJoin = 'round';
-  progCtx.lineWidth = 5;
-  progCtx.strokeStyle = 'rgba(190,235,255,0.9)';
-  progCtx.shadowColor = 'rgba(100,210,255,0.55)';
-  progCtx.shadowBlur = 12;
-  progCtx.setLineDash([visible, perim]);
+  
+  // Background track (subtle ring)
   progCtx.beginPath();
-  // Start at top-center, trace clockwise — the bar retracts back to top as time runs out.
-  progCtx.moveTo(x + w/2, y);
-  progCtx.lineTo(x + w - r, y); progCtx.arcTo(x + w, y, x + w, y + r, r);
-  progCtx.lineTo(x + w, y + h - r); progCtx.arcTo(x + w, y + h, x + w - r, y + h, r);
-  progCtx.lineTo(x + r, y + h); progCtx.arcTo(x, y + h, x, y + h - r, r);
-  progCtx.lineTo(x, y + r); progCtx.arcTo(x, y, x + r, y, r);
-  progCtx.lineTo(x + w/2, y);
+  progCtx.arc(cx, cy, r, 0, Math.PI * 2);
+  progCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+  progCtx.lineWidth = 6;
   progCtx.stroke();
-  progCtx.setLineDash([]); progCtx.shadowBlur = 0;
+  
+  const endAngle = -Math.PI/2 + (p * Math.PI * 2);
+  
+  // Outer glow (using a transparent stroke instead of heavy shadowBlur)
+  progCtx.beginPath();
+  progCtx.arc(cx, cy, r, -Math.PI/2, endAngle);
+  progCtx.strokeStyle = 'rgba(0, 198, 255, 0.25)';
+  progCtx.lineWidth = 20;
+  progCtx.lineCap = 'round';
+  progCtx.stroke();
+  
+  // Core bright ring
+  progCtx.beginPath();
+  progCtx.arc(cx, cy, r, -Math.PI/2, endAngle);
+  progCtx.strokeStyle = 'rgba(200, 240, 255, 0.95)';
+  progCtx.lineWidth = 8;
+  progCtx.stroke();
+  
   progTex.needsUpdate = true;
 }
+
 function wrapLines(ctx, text, maxW) {
   const out = [];
   for (const para of String(text).split('\n')) {
@@ -216,6 +250,7 @@ function wrapLines(ctx, text, maxW) {
   }
   return out;
 }
+
 function fitText(ctx, text, maxW, maxH, weight, baseSize, minSize) {
   let s = baseSize;
   while (s >= minSize) {
@@ -228,54 +263,73 @@ function fitText(ctx, text, maxW, maxH, weight, baseSize, minSize) {
   ctx.font = `${weight} ${minSize}px system-ui,sans-serif`;
   return { lines:wrapLines(ctx,text,maxW), size:minSize, lh:minSize*1.25 };
 }
+
 function updateUIText(title, instruction) {
   if (currentTitle === title && currentInstruction === instruction) return;
   currentTitle = title; currentInstruction = instruction;
+  
   uiCtx.clearRect(0, 0, 1024, 1024);
   uiCtx.textAlign = 'center'; uiCtx.textBaseline = 'middle';
+  
   const MAX_W = 720, MAX_H = 720, GAP = 30;
   let tData = null, iData = null, totalH = 0;
+  
   if (title) { tData = fitText(uiCtx, title, MAX_W, instruction ? 240 : MAX_H, 'bold', 100, 44); totalH += tData.lines.length * tData.lh; }
   if (instruction) { const remH = title ? Math.max(120, MAX_H - totalH - GAP) : MAX_H; iData = fitText(uiCtx, instruction, MAX_W, remH, title ? '500' : 'bold', title ? 60 : 90, 28); if (title) totalH += GAP; totalH += iData.lines.length * iData.lh; }
+  
   let y = 512 - totalH / 2;
+  
   if (tData) { uiCtx.fillStyle = '#ffffff'; uiCtx.shadowColor = 'rgba(100,210,255,0.8)'; uiCtx.shadowBlur = 18; uiCtx.font = `bold ${tData.size}px system-ui,-apple-system,"Segoe UI",sans-serif`; tData.lines.forEach((l,k)=>uiCtx.fillText(l, 512, y + tData.lh/2 + k*tData.lh)); y += tData.lines.length * tData.lh + (iData ? GAP : 0); }
   if (iData) { uiCtx.shadowBlur = title ? 0 : 16; uiCtx.shadowColor = 'rgba(100,210,255,0.6)'; uiCtx.fillStyle = title ? 'rgba(255,255,255,0.95)' : '#ffffff'; uiCtx.font = `${title ? '500' : 'bold'} ${iData.size}px system-ui,-apple-system,"Segoe UI",sans-serif`; iData.lines.forEach((l,k)=>uiCtx.fillText(l, 512, y + iData.lh/2 + k*iData.lh)); }
+  
   uiCtx.shadowBlur = 0;
   uiTex.needsUpdate = true;
 }
+
 function roundRect(ctx, x, y, w, h, r) {
   const rr = Math.min(r, w/2, h/2);
   ctx.beginPath(); ctx.moveTo(x+rr, y); ctx.arcTo(x+w, y, x+w, y+h, rr); ctx.arcTo(x+w, y+h, x, y+h, rr); ctx.arcTo(x, y+h, x, y, rr); ctx.arcTo(x, y, x+w, y, rr); ctx.closePath();
 }
+
 function setupClapHUD() {
   clapHUD = new THREE.Group();
-  clapHUD.position.set(0, 0.45, -1.5);
+  // Moved to match orb depth
+  clapHUD.position.set(0, 0.45, -2.0);
+  
   const c = document.createElement('canvas'); c.width = 1024; c.height = 220;
   const tex = new THREE.CanvasTexture(c); tex.minFilter = THREE.LinearFilter;
   const mesh = new THREE.Mesh( new THREE.PlaneGeometry(0.7, 0.151), new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthTest:false }) );
   mesh.renderOrder = 999;
+  
   clapHUD.add(mesh);
   clapHUD.userData = { canvas:c, ctx:c.getContext('2d'), tex };
   clapHUD.visible = false;
   camera.add(clapHUD);
 }
+
 function drawClapHUD() {
   clapHUD.visible = state.clapStart > 0;
   if (!clapHUD.visible) return;
+  
   const { ctx, tex } = clapHUD.userData;
   const W = 1024, H = 220, R = 110;
   ctx.clearRect(0, 0, W, H);
+  
   ctx.shadowColor='rgba(14,165,233,0.22)'; ctx.shadowBlur=28; ctx.shadowOffsetY=10; ctx.fillStyle='rgba(255,255,255,0.92)'; roundRect(ctx, 12, 8, W-24, H-24, R); ctx.fill();
   ctx.shadowColor='transparent'; ctx.shadowBlur=0; ctx.shadowOffsetY=0; ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=2; roundRect(ctx, 13, 9, W-26, H-26, R-1); ctx.stroke();
+  
   const elapsed = Date.now() - state.clapStart;
   const prog    = Math.min(1, elapsed / CLAP_TIME);
   const remain  = Math.max(0, Math.ceil((CLAP_TIME - elapsed) / 1000));
+  
   ctx.fillStyle='#0f172a'; ctx.font='800 52px -apple-system,"SF Pro Rounded","Segoe UI",Helvetica,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
   ctx.fillText(`👏 Hold sammen i ${remain}s for at lukke`, W/2, 78);
+  
   const bx=64, by=142, bw=W-128, bh=36, br=18; ctx.fillStyle='rgba(14,165,233,0.12)'; roundRect(ctx, bx, by, bw, bh, br); ctx.fill();
   if (prog > 0) { const g = ctx.createLinearGradient(bx, 0, bx+bw, 0); g.addColorStop(0, '#bae6fd'); g.addColorStop(1, '#0ea5e9'); ctx.fillStyle = g; roundRect(ctx, bx, by, Math.max(br*2, Math.round(bw*prog)), bh, br); ctx.fill(); }
   tex.needsUpdate = true;
 }
+
 function setupControllers() {
   for (let i = 0; i < 2; i++) {
     const c = renderer.xr.getController(i);
@@ -283,58 +337,74 @@ function setupControllers() {
     controllers.push(c);
   }
 }
-// "Big-brain" exit gesture: only triggers when hands are TOGETHER and held in a forward
-// cone from the head. Hands resting on chest/stomach are below the head → outside the
-// cone → false positive eliminated. Cone follows head pose, so it works for users who
-// are seated, standing, or lying down — and no instruction or visual change is required.
+
 function checkClap() {
   if (controllers.length < 2) { state.clapStart = 0; return; }
   const c1 = controllers[0], c2 = controllers[1];
   if (c1.position.lengthSq() === 0 || c2.position.lengthSq() === 0) { state.clapStart = 0; return; }
   if (c1.position.distanceTo(c2.position) > CLAP_DIST) { state.clapStart = 0; return; }
-  // Vector from head to hands midpoint, projected onto head's local forward axis.
+  
   camera.getWorldPosition(_v0);
   camera.getWorldQuaternion(_q0);
-  _v1.set(0, 0, -1).applyQuaternion(_q0);                           // head forward
+  _v1.set(0, 0, -1).applyQuaternion(_q0);
+  
   const midX = (c1.position.x + c2.position.x) * 0.5;
   const midY = (c1.position.y + c2.position.y) * 0.5;
   const midZ = (c1.position.z + c2.position.z) * 0.5;
   const dx = midX - _v0.x, dy = midY - _v0.y, dz = midZ - _v0.z;
-  const fwd = dx*_v1.x + dy*_v1.y + dz*_v1.z;                       // head-forward distance
+  
+  const fwd = dx*_v1.x + dy*_v1.y + dz*_v1.z;
   const len = Math.hypot(dx, dy, dz);
   const cosA = len > 1e-3 ? fwd / len : 0;
+  
   if (fwd < CLAP_FORWARD_MIN || cosA < CLAP_FORWARD_COS) { state.clapStart = 0; return; }
+  
   const now = Date.now();
   if (!state.clapStart) state.clapStart = now;
   else if (now - state.clapStart >= CLAP_TIME) { state.clapStart = 0; endXR(); }
 }
+
 function setupAudio() {
   audioListener = new THREE.AudioListener();
   camera.add(audioListener);
   oceanSound = new THREE.Audio(audioListener);
+  
   new THREE.AudioLoader().load(
     'https://actions.google.com/sounds/v1/water/waves_crashing_on_rock_beach.ogg',
-    b => { oceanSound.setBuffer(b); oceanSound.setLoop(true); oceanSound.setVolume(0); diag('audio: buffer loaded'); },
+    b => { 
+      oceanSound.setBuffer(b); 
+      oceanSound.setLoop(true); 
+      oceanSound.setVolume(0); 
+      diag('audio: buffer loaded');
+      // If the user already pressed START, begin immediately.
+      if (state.audioAllowed && !oceanSound.isPlaying) oceanSound.play();
+    },
     undefined,
     e => diag('audio load err: '+(e && e.message || 'unknown'))
   );
 }
+
 async function startXR() {
   if (!navigator.xr) { alert('WebXR understøttes ikke i denne browser.'); return; }
   try {
     const ar = await navigator.xr.isSessionSupported('immersive-ar');
     const session = await navigator.xr.requestSession(ar ? 'immersive-ar' : 'immersive-vr', { optionalFeatures:['dom-overlay'], domOverlay:{ root:document.body } });
+    
     document.getElementById('overlay').classList.add('webxr-hidden');
     renderer.xr.setReferenceSpaceType('local');
     renderer.xr.setSession(session);
+    
     state.xrSession = session;
     state.layersConfigured = false;
+    
     session.addEventListener('select', () => {
       if (audioListener.context.state === 'suspended') audioListener.context.resume();
       if (oceanSound && oceanSound.buffer && !oceanSound.isPlaying) oceanSound.play();
       if (videoEl && videoEl.paused) videoEl.play().catch(()=>{});
     });
+    
     setTimeout(() => { if (videoEl && videoEl.paused) videoEl.play().catch(()=>{}); }, 800);
+    
     state.isPlaying = true;
     state.elapsedTime = 0; state.clapStart = 0; state.lastProgressDraw = -1;
     state.clock.start();
@@ -342,6 +412,7 @@ async function startXR() {
     session.addEventListener('end', endXR);
   } catch (e) { alert('Kunne ikke starte WebXR: ' + e.message); }
 }
+
 function endXR() {
   if (state.xrSession) state.xrSession.end();
   state.isPlaying = false;
@@ -352,95 +423,122 @@ function endXR() {
   state.xrSession = null;
   setTimeout(() => location.reload(), 300);
 }
+
 function render() {
   if (!state.isPlaying) return;
   const dt = state.clock.getDelta();
   state.elapsedTime += dt;
+  
   if (videoEl && videoEl.paused && videoEl.readyState >= 2) {
     if (state.elapsedTime - state.lastVideoPlayAttempt > 1.0) {
       state.lastVideoPlayAttempt = state.elapsedTime;
       videoEl.play().catch(() => {});
     }
   }
+  
   if (!state.layersConfigured && state.xrSession) {
     const xrCam = renderer.xr.getCamera();
     if (xrCam.cameras && xrCam.cameras.length >= 2) { xrCam.cameras[0].layers.enable(1); xrCam.cameras[1].layers.enable(2); state.layersConfigured = true; }
     else if (xrCam.cameras && xrCam.cameras.length === 1) { xrCam.cameras[0].layers.enable(1); state.layersConfigured = true; }
   }
+  
   if (state.lastCameraPos.lengthSq() === 0 && camera.position.lengthSq() > 0) state.lastCameraPos.copy(camera.position);
   const dx = camera.position.x - state.lastCameraPos.x;
   const dz = camera.position.z - state.lastCameraPos.z;
   const speed = dt > 0 ? Math.sqrt(dx*dx + dz*dz) / dt : 0;
+  
   state.timeSinceLastMove = speed > 0.25 ? 0 : state.timeSinceLastMove + dt;
   state.lastCameraPos.copy(camera.position);
+  
   if (state.elapsedTime < INTRO_DURATION) handleIntroPhase();
   else if (state.elapsedTime < INTRO_DURATION + BREATHING_DURATION) handleBreathingPhase();
   else handleCompletionPhase();
+  
   const moving = state.timeSinceLastMove < 10.0;
   const target = moving ? 0.0 : state.baseEnvOpacity;
   const fade = moving ? 4.0 : 0.5;
   state.currentEnvOpacity += (target - state.currentEnvOpacity) * fade * dt;
+  
   if (leftMat)  leftMat.opacity  = state.currentEnvOpacity;
   if (rightMat) rightMat.opacity = state.currentEnvOpacity;
+  
+  // Audio will automatically fade in here once started
   if (oceanSound) oceanSound.setVolume(state.currentEnvOpacity);
+  
   orbGroup.position.y = -0.1 + Math.sin(state.elapsedTime * 0.5) * 0.03;
   orbMesh.rotation.y += 0.1 * dt;
   orbMesh.rotation.z += 0.05 * dt;
+  
   checkClap();
   drawClapHUD();
   renderer.render(scene, camera);
 }
+
 function handleIntroPhase() {
   state.phase = 'INTRO'; state.baseEnvOpacity = 0.0;
   let instr;
   if      (state.elapsedTime < INTRO_SEGMENTS[0]) instr = `En ${TOTAL_LABEL} session.\nLæg venstre hånd på brystet,\nog højre hånd på maven.`;
   else if (state.elapsedTime < INTRO_SEGMENTS[1]) instr = "Mærk din naturlige vejrtrækning.\nMaven skal udvide sig, når du ånder ind.";
   else                                            instr = "Vi trækker vejret sammen.\nInd i 4 sek, ud i 6 sek.";
+  
   updateUIText('Mavevejrtrækning', instr);
-  // Per-segment depleting ring → each segment fills the ring then drains as the next part approaches.
+  
   let segStart = 0, segEnd = INTRO_SEGMENTS[0];
   for (let i = 0; i < INTRO_SEGMENTS.length; i++) {
     if (state.elapsedTime < INTRO_SEGMENTS[i]) { segEnd = INTRO_SEGMENTS[i]; segStart = i > 0 ? INTRO_SEGMENTS[i-1] : 0; break; }
   }
+  
   const segP = 1 - (state.elapsedTime - segStart) / Math.max(0.001, segEnd - segStart);
   progMesh.visible = true;
   drawProgress(segP);
-  orbGroup.scale.lerp(_v0.set(2.4,2.4,2.4), 0.03);
+  
+  // 20% smaller (2.4 * 0.8 = 1.92)
+  orbGroup.scale.lerp(_v0.set(1.92, 1.92, 1.92), 0.03);
   orbMesh.material.emissiveIntensity = THREE.MathUtils.lerp(orbMesh.material.emissiveIntensity, 0.3, 0.05);
   orbLight.intensity = THREE.MathUtils.lerp(orbLight.intensity, 1.0, 0.05);
 }
+
 function handleBreathingPhase() {
   state.phase = 'BREATHING';
   if (progMesh.visible) { progMesh.visible = false; drawProgress(0); }
+  
   const t = state.elapsedTime - INTRO_DURATION;
   state.baseEnvOpacity = Math.min(t / 120.0, 1.0);
   const cycle = t % 10;
+  
   if (cycle < 4.0) {
     updateUIText('', 'Træk vejret ind...');
     const ease = 1 - Math.pow(1 - cycle/4.0, 3);
-    orbGroup.scale.setScalar(1.0 + ease);
+    // 20% smaller overall scale for breathing
+    orbGroup.scale.setScalar(0.8 * (1.0 + ease));
     orbMesh.material.emissiveIntensity = 0.2 + ease;
     orbLight.intensity = 0.5 + ease * 2.0;
   } else {
     updateUIText('', 'Pust langsomt ud...');
     const ease = -(Math.cos(Math.PI * (cycle-4.0)/6.0) - 1) / 2;
-    orbGroup.scale.setScalar(2.0 - ease);
+    // 20% smaller overall scale for exhaling
+    orbGroup.scale.setScalar(0.8 * (2.0 - ease));
     orbMesh.material.emissiveIntensity = 1.2 - ease;
     orbLight.intensity = 2.5 - ease * 2.0;
   }
 }
+
 function handleCompletionPhase() {
   state.phase = 'DONE'; state.baseEnvOpacity = 1.0;
   if (progMesh.visible) { progMesh.visible = false; drawProgress(0); }
   updateUIText('Færdig', "Sessionen er slut.\nNyd stilheden et øjeblik.");
-  orbGroup.scale.lerp(_v0.set(1.5,1.5,1.5), 0.03);
+  
+  // 20% smaller (1.5 * 0.8 = 1.2)
+  orbGroup.scale.lerp(_v0.set(1.2, 1.2, 1.2), 0.03);
   orbMesh.material.emissiveIntensity = THREE.MathUtils.lerp(orbMesh.material.emissiveIntensity, 0.2, 0.05);
   orbLight.intensity = THREE.MathUtils.lerp(orbLight.intensity, 0.8, 0.05);
 }
+
 function onResize() {
   if (!camera || !renderer) return;
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight);
 }
+
 init();
 </script>
 </body>
